@@ -129,6 +129,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+import pudb
 
 
 # Set to False to skip notebook execution (e.g. for debugging)
@@ -243,6 +244,7 @@ class EncoderDecoder(nn.Module):
 
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
+        pudb.set_trace()
         return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
 
     def encode(self, src, src_mask):
@@ -258,9 +260,11 @@ class Generator(nn.Module):
 
     def __init__(self, d_model, vocab):
         super(Generator, self).__init__()
+        pudb.set_trace()
         self.proj = nn.Linear(d_model, vocab)
 
     def forward(self, x):
+        pudb.set_trace()
         return log_softmax(self.proj(x), dim=-1)
 
 
@@ -294,11 +298,13 @@ class Encoder(nn.Module):
 
     def __init__(self, layer, N):
         super(Encoder, self).__init__()
+        pudb.set_trace()
         self.layers = clones(layer, N)
         self.norm = LayerNorm(layer.size)
 
     def forward(self, x, mask):
         "Pass the input (and mask) through each layer in turn."
+        pudb.set_trace()
         for layer in self.layers:
             x = layer(x, mask)
         return self.norm(x)
@@ -322,8 +328,11 @@ class LayerNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        pudb.set_trace()
+        # x: [1, 10, 512]
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
+        # output: [1, 10, 512]
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 
@@ -349,11 +358,13 @@ class SublayerConnection(nn.Module):
 
     def __init__(self, size, dropout):
         super(SublayerConnection, self).__init__()
+        pudb.set_trace()
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
+        pudb.set_trace()
         return x + self.dropout(sublayer(self.norm(x)))
 
 
@@ -369,6 +380,7 @@ class EncoderLayer(nn.Module):
 
     def __init__(self, size, self_attn, feed_forward, dropout):
         super(EncoderLayer, self).__init__()
+        pudb.set_trace()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 2)
@@ -376,6 +388,7 @@ class EncoderLayer(nn.Module):
 
     def forward(self, x, mask):
         "Follow Figure 1 (left) for connections."
+        pudb.set_trace()
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
         return self.sublayer[1](x, self.feed_forward)
 
@@ -392,10 +405,12 @@ class Decoder(nn.Module):
 
     def __init__(self, layer, N):
         super(Decoder, self).__init__()
+        pudb.set_trace()
         self.layers = clones(layer, N)
         self.norm = LayerNorm(layer.size)
 
     def forward(self, x, memory, src_mask, tgt_mask):
+        pudb.set_trace()
         for layer in self.layers:
             x = layer(x, memory, src_mask, tgt_mask)
         return self.norm(x)
@@ -415,6 +430,7 @@ class DecoderLayer(nn.Module):
 
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
         super(DecoderLayer, self).__init__()
+        pudb.set_trace()
         self.size = size
         self.self_attn = self_attn
         self.src_attn = src_attn
@@ -423,6 +439,7 @@ class DecoderLayer(nn.Module):
 
     def forward(self, x, memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
+        pudb.set_trace()
         m = memory
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
         x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
@@ -516,15 +533,24 @@ show_example(example_mask)
 # $$
 
 # %% id="qsoVxS5yTsqG"
+# query: [1, 8, 10, 64]
+# key: [1, 8, 10, 64]
+# value: [1, 8, 10, 64]
+# mask: [1, 1, 1, 10]
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
+    pudb.set_trace()
+    # 64
     d_k = query.size(-1)
+    # [1, 8, 10, 10]
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
+    # [1, 8, 10, 10]
     p_attn = scores.softmax(dim=-1)
     if dropout is not None:
         p_attn = dropout(p_attn)
+    # matmul: [1, 8, 10, 64], p_attn: [1, 8, 10, 10]
     return torch.matmul(p_attn, value), p_attn
 
 
@@ -590,41 +616,57 @@ class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
         "Take in model size and number of heads."
         super(MultiHeadedAttention, self).__init__()
+        pudb.set_trace()
         assert d_model % h == 0
         # We assume d_v always equals d_k
+        # self.d_k: 64
         self.d_k = d_model // h
+        # self.h: 8
         self.h = h
+        # d_model: 512
+        # Each linear layer: input 512, output 512
         self.linears = clones(nn.Linear(d_model, d_model), 4)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
+    # query, key, value: [1, 10, 512]
     def forward(self, query, key, value, mask=None):
+        pudb.set_trace()
         "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all h heads.
             mask = mask.unsqueeze(1)
+        # nbatches: 1
         nbatches = query.size(0)
 
         # 1) Do all the linear projections in batch from d_model => h x d_k
+        # query, key, value updated to : [1, 8, 10, 64]
         query, key, value = [
             lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
             for lin, x in zip(self.linears, (query, key, value))
         ]
 
         # 2) Apply attention on all the projected vectors in batch.
+        # x: [1, 8, 10, 64]
+        # self.attn: [1, 8, 10, 10]
+        # 在最后两个dim (10, 64) 中做attention。这下等于做了8份独立的self attention
         x, self.attn = attention(
             query, key, value, mask=mask, dropout=self.dropout
         )
 
         # 3) "Concat" using a view and apply a final linear.
+        # 把8个独立attention的结果，拼成一起，最终拼回到[1, 10, 512]，也就是和最早的输入大小完全一致
+        # transpose只是为了操作方便，并不影响model的学习能力
+        # 我也承认这里的做法并不是唯一可行的做法
         x = (
-            x.transpose(1, 2)
-            .contiguous()
-            .view(nbatches, -1, self.h * self.d_k)
+            x.transpose(1, 2)  # becomes [1, 10, 8, 64]
+            .contiguous()  # make a deep copy of Tensor
+            .view(nbatches, -1, self.h * self.d_k)  # reshape into [1, 10, 512]
         )
         del query
         del key
         del value
+        # output: [1, 10, 512]
         return self.linears[-1](x)
 
 
@@ -677,13 +719,19 @@ class MultiHeadedAttention(nn.Module):
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
 
+    # d_model: 512
+    # d_ff: 2048
     def __init__(self, d_model, d_ff, dropout=0.1):
         super(PositionwiseFeedForward, self).__init__()
+        pudb.set_trace()
+        # in: 512, out: 2048
         self.w_1 = nn.Linear(d_model, d_ff)
+        # in: 2048, out: 512
         self.w_2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        pudb.set_trace()
         return self.w_2(self.dropout(self.w_1(x).relu()))
 
 
@@ -704,10 +752,14 @@ class PositionwiseFeedForward(nn.Module):
 class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
         super(Embeddings, self).__init__()
+        pudb.set_trace()
+        # 11 -> 512
         self.lut = nn.Embedding(vocab, d_model)
         self.d_model = d_model
 
+    # output: [1, 10, 512]
     def forward(self, x):
+        pudb.set_trace()
         return self.lut(x) * math.sqrt(self.d_model)
 
 
@@ -748,22 +800,30 @@ class Embeddings(nn.Module):
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
 
+    # d_model: 512
     def __init__(self, d_model, dropout, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
+        pudb.set_trace()
 
         # Compute the positional encodings once in log space.
+        # pe: [5000, 512]
         pe = torch.zeros(max_len, d_model)
+        # [5000, 1]
         position = torch.arange(0, max_len).unsqueeze(1)
+        # [512]
         div_term = torch.exp(
             torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
+        # becomes [1, 5000, 512]
         pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe)
 
+    # output: [1, 10, 512]
     def forward(self, x):
+        pudb.set_trace()
         x = x + self.pe[:, : x.size(1)].requires_grad_(False)
         return self.dropout(x)
 
@@ -801,7 +861,7 @@ def example_positional():
     )
 
 
-show_example(example_positional)
+# show_example(example_positional)
 
 
 # %% [markdown] id="g8rZNCrzTsqI"
@@ -824,9 +884,13 @@ def make_model(
 ):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
+    pudb.set_trace()
     attn = MultiHeadedAttention(h, d_model)
+    pudb.set_trace()
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    pudb.set_trace()
     position = PositionalEncoding(d_model, dropout)
+    pudb.set_trace()
     model = EncoderDecoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
         Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
@@ -834,6 +898,7 @@ def make_model(
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
         Generator(d_model, tgt_vocab),
     )
+    pudb.set_trace()
 
     # This was important from their code.
     # Initialize parameters with Glorot / fan_avg.
@@ -1158,6 +1223,7 @@ class LabelSmoothing(nn.Module):
         self.true_dist = None
 
     def forward(self, x, target):
+        pudb.set_trace()
         assert x.size(1) == self.size
         true_dist = x.data.clone()
         true_dist.fill_(self.smoothing / (self.size - 2))
