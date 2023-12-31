@@ -3,6 +3,7 @@ from os.path import exists
 import torch
 import torch.nn as nn
 from torch.nn.functional import log_softmax, pad
+from torch.utils.tensorboard import SummaryWriter
 import math
 import copy
 import time
@@ -22,6 +23,9 @@ import pudb
 
 # Set to False to skip notebook execution (e.g. for debugging)
 warnings.filterwarnings("ignore")
+
+# TensorBoard看graph意义真的不大，还不如print(nn.Module)看的清楚
+tb_writer = SummaryWriter()
 
 
 class DummyOptimizer(torch.optim.Optimizer):
@@ -360,7 +364,6 @@ def make_model(
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
         Generator(d_model, tgt_vocab),
     )
-    # 
 
     # This was important from their code.
     # Initialize parameters with Glorot / fan_avg.
@@ -513,6 +516,8 @@ class SimpleLossCompute:
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
     memory = model.encode(src, src_mask)
+    # pudb.set_trace()
+    # tb_writer.add_graph(model.encoder, [model.src_embed(src), src_mask])
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
         out = model.decode(
@@ -885,6 +890,7 @@ def check_outputs(
         print("\nExample %d ========\n" % idx)
         b = next(iter(valid_dataloader))
         rb = Batch(b[0], b[1], pad_idx)
+        # pudb.set_trace()
         greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
 
         src_tokens = [
@@ -943,4 +949,8 @@ def run_model_example(n_examples=5):
 
 
 model = load_trained_model()
-run_model_example()
+run_model_example(1)
+# pudb.set_trace()
+
+tb_writer.flush()
+tb_writer.close()
