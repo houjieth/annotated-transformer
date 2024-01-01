@@ -124,7 +124,7 @@ class LayerNorm(nn.Module):
         # x: [1, sl, 512]
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
-        # output: [1, sl, 512]
+        # output: [bs, sl, 512]
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 
@@ -195,13 +195,39 @@ class DecoderLayer(nn.Module):
     def forward(self, x, memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
         # x仅包含目前已经生成的长度，所以比memory的size小很多
-        # 比如x: [bs, 1, 512], memory: [bs, sl, 512]
-        pudb.set_trace()
-        m = memory
+        # 比如x刚开始只有一个start_symbol，shape是: [bs, 1, 512], 而memory: [bs, sl, 512]
+        # pudb.set_trace()
+        m = memory  # memory来自于encoder的输出
         # 第一步是self attention，也就是已经decode输出的部分自我之间的attention
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        # 这里的关键是当x和m大小不一样时候怎么办
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        # 注意self attention的输入的shape，不要求是大小都固定，比如都为[bs, sl, 512], 可以是[bs, 任意大小, 512]
+        # 因为attention的Q*K^T的结果（我叫做attention matrix），是可以大也可以小的，因为query和key的shape大小可以不同！
+        #   - 当然key和value的shape必须相同！(必须都是一样的行数，也就是表达一样个数的words)
+        #   - query代表的words数量可以<=key,value代表的word数量
+        # 是的，attention matrix从来没有说必须是方阵！可以是任何长宽
+        # attention matrix的第i行表示第query中第i个word应该怎么受到key和value代表的所有的word的线性组合来影响（也就是叫做被attend）
+        # 所以这样就很容易理解：
+        #   1. 当query的size小于key,value的size的情况。比如query就只有一行，key value是k行，那么attention matrix的大小也是1行k列的，
+        #      代表query这一个word应该由这key,value的k个word做这样的线性组合来attend
+        #   2. mask的使用：
+        #      - 如果是self attend，那么attention matrix是方阵。mask应该为左下一半都是1（包含对角线）的方阵，意思表示每一个word都只能被
+        #      - 它自身和前面的word来attend，这样是符合decoder自回归的使用方式（也就是只有encoder会提前看到后面的word，而decoder只能看到自己
+        #        已经生成的word，看不到自己未来即将生成的word（这不废话吗））
+        #        你可以让attention matrix * 这个mask矩阵，结果就是attention matrix右上部分(不包括对角线)都变成-1e9,这样当attention matrix
+        #        对每列进行softmax操作的时候，被mask的部分就会得到一个基本上等于0的值，也就是清除了对应word参加attend的影响
+        #      - decoder输出的query和encoder的key&value attend（也叫做cross attend），那么mask并不一定是方阵，但应该是一个左边若干列为1，右边
+        #        若干列为0的样式，然后我们用mask_fill来把attention matrix中mask为0的位置写上-1e9, 这样的目的是只让key&value句子当中前面几个word
+        #        可以参加attend，因为句子后面的word都是placeholder而已（为0），是没有真正的word的
+        #        实际操作的时候，因为tensor.mask_fill的输入mask只要可以broadcast到tensor就可以了，所以实际上这里的mask shape并不是attention matrix
+        #        的shape([bs,8,sl,sl])，而是[bs,1,1,sl]，也就是最后一维中下标i表示第i个word是placeholder，应该忽略
+        #        所以，这里面代码，如果是self attention, query和key&value都代表是k个word, 那么，mask是[bs,1,query_word_count,query_word_count], attention matrix
+        #        shape为[bs,8,query_word_count,query_word_count]
+        #        如果是cross attention，mask是[bs,1,1,sl], attention matrix shape为[bs,8,query_word_count,sl/8]
+        #        这两种shape都可以broadcast到各自的attention matrix. 前者相当于是每个attention matrix（即最后两维）每个行列都被[query_word_count, query_word_count]的mask处理了一遍，
+        #        也就是一种2维mask处理（三角形mask）
+        #        后者相当于是每个attention matrix的每个最后一维都被一个[sl]的mask处理了一遍，也就是是一个一维mask，每行的mask处理都完全一样
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))  # self attention on decoder's output
+        # x经常是小于m的size的，因为x(query)代表的word数量要小于m(key&value)代表的word数量
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))  # cross attention between encoder's output and decoder's output
         return self.sublayer[2](x, self.feed_forward)
 
 
@@ -216,18 +242,19 @@ def subsequent_mask(size):
 
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
-    # 
     # 64
     d_k = query.size(-1)
-    # [1, 8, sl, sl]
+    # [bs, 8, sl, sl]
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
-    # [1, 8, sl, sl]
+    # [bs, 8, sl, sl]
     p_attn = scores.softmax(dim=-1)
     if dropout is not None:
         p_attn = dropout(p_attn)
-    # matmul: [1, 8, sl, 64], p_attn: [1, 8, sl, sl]
+    # p_attn: [bs, 8, sl, sl]
+    # value: [bs, 8, sl, 64]
+    # matmul结果: [bs, 8, sl, 64]
     return torch.matmul(p_attn, value), p_attn
 
 
@@ -248,14 +275,14 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
-    # query, key, value: [1, sl, 512]
+    # query, key, value: [bs, sl, 512]
     # 但注意在做cross attention（decoding阶段）时，有可能query（从decoder出来，大小可能还很小因为才刚生成很少的word）
     # 的size要小于key和value的size，比如
     # query: [bs, 1, 512]
     # key: [bs, sl, 512]
     # value: [bs, sl, 512]
     def forward(self, query, key, value, mask=None):
-        pudb.set_trace()
+        # pudb.set_trace()
         # 
         "Implements Figure 2"
         if mask is not None:
@@ -265,34 +292,38 @@ class MultiHeadedAttention(nn.Module):
         nbatches = query.size(0)
 
         # 1) Do all the linear projections in batch from d_model => h x d_k
-        # query, key, value updated to : [1, 8, sl, 64]
+        # query, key, value from [bs, sl, 512],
+        # for each,
+        # after linear [bs, sl, 512]
+        # after view (reshape): [bs, sl, 8, 64]
+        # after transpose (switch sl dim (index1) and h dim(index 2), updated to : [bs, 8, sl, 64]
         query, key, value = [
             lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-            for lin, x in zip(self.linears, (query, key, value))
+            for lin, x in zip(self.linears, (query, key, value))  # 注意这里zip出了3个pair，也就是说只用了前三个512x512 linear layer
         ]
 
         # 2) Apply attention on all the projected vectors in batch.
-        # x: [1, 8, sl, 64]
-        # self.attn: [1, 8, sl, 10]
+        # x: [bs, 8, sl, 64]：这个是attention输出
+        # self.attn: [bs, 8, sl, sl]: 这个叫做attention matrix（这里返回没啥用）
         # 在最后两个dim (sl, 64) 中做attention。这下等于做了8份独立的self attention
         x, self.attn = attention(
             query, key, value, mask=mask, dropout=self.dropout
         )
 
         # 3) "Concat" using a view and apply a final linear.
-        # 把8个独立attention的结果，拼成一起，最终拼回到[1, sl, 512]，也就是和最早的输入大小完全一致
+        # 把8个独立attention的结果，拼成一起，最终拼回到[bs, sl, 512]，也就是和最早的输入大小完全一致
         # transpose只是为了操作方便，并不影响model的学习能力
         # 我也承认这里的做法并不是唯一可行的做法
         x = (
-            x.transpose(1, 2)  # becomes [1, sl, 8, 64]
+            x.transpose(1, 2)  # x from [bs, 8, sl, 64] to [bs, sl, 8, 64]
             .contiguous()  # make a deep copy of Tensor
-            .view(nbatches, -1, self.h * self.d_k)  # reshape into [1, sl, 512]
+            .view(nbatches, -1, self.h * self.d_k)  # reshape into [bs, sl, 512]
         )
         del query
         del key
         del value
-        # output: [1, sl, 512]
-        return self.linears[-1](x)
+        # output: [bs, sl, 512]
+        return self.linears[-1](x)  # 这里用上了第四个512x512的linear layer
 
 
 class PositionwiseFeedForward(nn.Module):
@@ -326,7 +357,7 @@ class Embeddings(nn.Module):
         # 所以nn.Embedding自己内部其实做了one-hot encoding以及linear forward等操作
         self.d_model = d_model
 
-    # output: [1, sl, 512]
+    # output: [bs, sl, 512]
     def forward(self, x):
         # 
         return self.lut(x) * math.sqrt(self.d_model)
@@ -352,11 +383,11 @@ class PositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        # becomes [1, 5000, 512]
+        # becomes [bs, 5000, 512]
         pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe)
 
-    # output: [1, sl, 512]
+    # output: [bs, sl, 512]
     def forward(self, x):
         # 
         x = x + self.pe[:, : x.size(1)].requires_grad_(False)
@@ -368,7 +399,7 @@ def make_model(
 ):
     # src_vocab = 8315
     # tgt_vocab = 6384
-    pudb.set_trace()
+    # pudb.set_trace()
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     # 
@@ -537,10 +568,10 @@ class SimpleLossCompute:
 
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
-    # src: [bs, 128(句长)]
-    # src_mask: [bs, 1, 128(句长)]
+    # src: [bs, sl]
+    # src_mask: [bs, 1, sl]
     # pudb.set_trace()
-    # memory: [bs, 128(句长), 512(每个词的feature size)]
+    # memory: [bs, sl, 512]
     memory = model.encode(src, src_mask)
     print(model.encoder)
     # pudb.set_trace()
@@ -549,20 +580,22 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
     # 最开始ys只有一个句首的start_symbol(数字0)，然后先predict一个词（无中生有），放到ys，然后ys里面有两个word了
     # 然后ys
     pudb.set_trace()
+    # ys初始为[bs,1]. ys存的就是prediction输出结果
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
-        # out: [1, 1, 512]
+        # out: [bs, 1, 512]
         mask = subsequent_mask(ys.size(1))
         # mask是一个size递增的方阵，其左下角（包括对角线）都是true，其余都是false。这个就是作为attention mask用，
         # 防止和还没有输出位置的词汇产生attention
         out = model.decode(
             memory, src_mask, ys, mask.type_as(src.data)
         )
-        # out: [1, 6384]
+        # out: [bs, 6384]
         prob = model.generator(out[:, -1])
         _, next_word = torch.max(prob, dim=1)
         next_word = next_word.data[0]
         ys = torch.cat(
+            # ys最后一个dim的大小+1，也就是[bs,1]=>[bs,2], [bs,2]=>[bs,3]这样
             [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
         )
     return ys
