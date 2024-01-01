@@ -80,7 +80,7 @@ class Generator(nn.Module):
 
     def __init__(self, d_model, vocab):
         super(Generator, self).__init__()
-        # 
+        # 512 -> vocab size
         self.proj = nn.Linear(d_model, vocab)
 
     def forward(self, x):
@@ -473,6 +473,7 @@ def run_epoch(
     total_loss = 0
     tokens = 0
     n_accum = 0
+    # pudb.set_trace()
     for i, batch in enumerate(data_iter):
         out = model.forward(
             batch.src, batch.tgt, batch.src_mask, batch.tgt_mask
@@ -579,26 +580,55 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
     # ys存的就是长度逐渐变长的prediction结果
     # 最开始ys只有一个句首的start_symbol(数字0)，然后先predict一个词（无中生有），放到ys，然后ys里面有两个word了
     # 然后ys
-    pudb.set_trace()
+    # pudb.set_trace()
     # ys初始为[bs,1]. ys存的就是prediction输出结果
+    # 过一个循环，ys变成[bs, 2], 再过一个循环变成[bs, 3]...
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
-        # out: [bs, 1, 512]
-        mask = subsequent_mask(ys.size(1))
+        # TODO: out的shape好像有问题
+        # ys_mask: [ys.size(1), ys.size(1)]，或者说是[ys的词数量,ys的词数量]
+        ys_mask = subsequent_mask(ys.size(1))
+        pudb.set_trace()
         # mask是一个size递增的方阵，其左下角（包括对角线）都是true，其余都是false。这个就是作为attention mask用，
         # 防止和还没有输出位置的词汇产生attention
+        # src_mask: [bs, 1, sl]
+        # out: [bs, ys词数量, 512]
+        # 注意这个decode的输出有多少个word取决于其输入的ys有多少个word！
         out = model.decode(
-            memory, src_mask, ys, mask.type_as(src.data)
+            memory, src_mask, ys, ys_mask.type_as(src.data)
         )
-        # out: [bs, 6384]
+        # 选输出的最后一个词的feature vector来放入generator，也就是说out[:,-1]的shape一定为[bs, 512]
         prob = model.generator(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        next_word = next_word.data[0]
+        # prob: [bs, 6384]
+        _, next_word = torch.max(prob, dim=1)  # next_word: [1]
+        next_word = next_word.data[0]  # 把next_word里面唯一的一个值拿出来
         ys = torch.cat(
             # ys最后一个dim的大小+1，也就是[bs,1]=>[bs,2], [bs,2]=>[bs,3]这样
             [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
         )
     return ys
+    # 注意，这里 有一个重大的提示。你看到，因为我们在tgt中，还是ys中，第一个词永远都是start_symbol(0)，所以这就造成
+    # decoder里面self attention中，如果我们mask确实是左下角都为1的阵且对角线的值也为1，看似好像意思是说，
+    # 第k行的词(k从1开始算)，是可以用1行~k行词加权出来的. 但其实因为tgt和ys都手工塞入了start_symbol为第一个词，
+    # 所以第k行的词的attend过程，本质上最多用到前面k-1个词。而第k行的输出，直接会送给generator来告诉我最终的第k个输出(k从1算)
+    # 所以，第一个词的inference（也就是ys中下标为1的那个词，下标为0为start_symbol），根本就没让decoder用上任何有意义的词汇(只用了start_symbol)
+    #
+    # 这样，如果我们在training阶段，直接把整个src和tgt都喂给encoder+decoder网络，等于说上来就给ys写满了，其长度为tgt.length
+    # 这样大小的ys进去上面，就不用走循环了，而是一步就输出了tgt.length这么多行，也就是直接输出了tgt.length这么多word，一次inference就完成了
+    # 整句话的输出。 但由于ys[0]是start_symbol，用上述说的左下角阵为mask，你会看到整个decoder都从来没有 **用第k个词去生成第k个词** 。
+    # 第k个词的生成，decoder网络中能参与的只有它前面的tgt的词汇 (encoder当然是src的所有词汇)
+    # 所以，看似好像tgt都给你了，让你去学target，好像可以抄近路，但由于每个词的输出，都必须是他前面的词的线性组合(attend)产生，所以这个位置的
+    # gt的词，反而没法参与这个线性组合！所以这样做training才是不可能作弊的，能训练出来内容的。而且这样训练速度可以很快
+    # 真心可以有大量并行训练！
+
+    # 但是在使用model的时候，因为只有src，没有tgt，所以就不得不用ys从start_symbol开始，一次inference生成一个词了。所以实际使用时候并行能力
+    # 要差不少。
+
+    # 这里也是给你一个对于transformer的一个重要理解：你发现，整个transformer网络，只有在attention阶段，能让多个词的feature进行一定的交叉融合
+    # 其他的所有地方，比如multihead attention后面的feed forward，还是最开始的word embedding，还是QKV生成的linear以及attention之后的linear
+    # (恢复成512宽度，也就是生成QKV之外的第四个linear)，还是最后的generator，他们都是只有一个word自身的内部线性变换，然后变换完了，还是仅仅
+    # 来表示自己。对比CNN网络，如果我们把pixel当成是word，这就相当于，整个网络，除了attention部分是有类似于conv2d的多pixel feature融合，其他
+    # 的地方就tmd全都是1x1的卷积。仅有1x1卷积CNN网络结果，就相当于是没有attention的结果。所以convolution和attention是完全可以类比的东西
 
 
 def load_tokenizers():
@@ -857,6 +887,7 @@ def train_worker(
 
         model.train()
         print(f"[GPU{gpu}] Epoch {epoch} Training ====", flush=True)
+        pudb.set_trace()
         _, train_state = run_epoch(
             (Batch(b[0], b[1], pad_idx) for b in train_dataloader),
             model,
