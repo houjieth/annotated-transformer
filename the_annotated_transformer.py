@@ -67,6 +67,10 @@ class EncoderDecoder(nn.Module):
     def encode(self, src, src_mask):
         return self.encoder(self.src_embed(src), src_mask)
 
+    # tgt的长度是逐渐增长的，因为一个个输出的词汇会往里面append
+    # tgt: [bs, 已生成词汇数量（包含最开始的start_symbol）]
+    # self.tgt_embed(tgt): [bs, tgt.size(1), 512]
+    # memory: [bs, 128(句长), 512]
     def decode(self, memory, src_mask, tgt, tgt_mask):
         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
 
@@ -117,10 +121,10 @@ class LayerNorm(nn.Module):
 
     def forward(self, x):
         # 
-        # x: [1, 10, 512]
+        # x: [1, sl, 512]
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
-        # output: [1, 10, 512]
+        # output: [1, sl, 512]
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 
@@ -190,9 +194,13 @@ class DecoderLayer(nn.Module):
 
     def forward(self, x, memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
-        # 
+        # x仅包含目前已经生成的长度，所以比memory的size小很多
+        # 比如x: [bs, 1, 512], memory: [bs, sl, 512]
+        pudb.set_trace()
         m = memory
+        # 第一步是self attention，也就是已经decode输出的部分自我之间的attention
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        # 这里的关键是当x和m大小不一样时候怎么办
         x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
         return self.sublayer[2](x, self.feed_forward)
 
@@ -211,15 +219,15 @@ def attention(query, key, value, mask=None, dropout=None):
     # 
     # 64
     d_k = query.size(-1)
-    # [1, 8, 10, 10]
+    # [1, 8, sl, sl]
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
-    # [1, 8, 10, 10]
+    # [1, 8, sl, sl]
     p_attn = scores.softmax(dim=-1)
     if dropout is not None:
         p_attn = dropout(p_attn)
-    # matmul: [1, 8, 10, 64], p_attn: [1, 8, 10, 10]
+    # matmul: [1, 8, sl, 64], p_attn: [1, 8, sl, sl]
     return torch.matmul(p_attn, value), p_attn
 
 
@@ -240,8 +248,14 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
-    # query, key, value: [1, 10, 512]
+    # query, key, value: [1, sl, 512]
+    # 但注意在做cross attention（decoding阶段）时，有可能query（从decoder出来，大小可能还很小因为才刚生成很少的word）
+    # 的size要小于key和value的size，比如
+    # query: [bs, 1, 512]
+    # key: [bs, sl, 512]
+    # value: [bs, sl, 512]
     def forward(self, query, key, value, mask=None):
+        pudb.set_trace()
         # 
         "Implements Figure 2"
         if mask is not None:
@@ -251,33 +265,33 @@ class MultiHeadedAttention(nn.Module):
         nbatches = query.size(0)
 
         # 1) Do all the linear projections in batch from d_model => h x d_k
-        # query, key, value updated to : [1, 8, 10, 64]
+        # query, key, value updated to : [1, 8, sl, 64]
         query, key, value = [
             lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
             for lin, x in zip(self.linears, (query, key, value))
         ]
 
         # 2) Apply attention on all the projected vectors in batch.
-        # x: [1, 8, 10, 64]
-        # self.attn: [1, 8, 10, 10]
-        # 在最后两个dim (10, 64) 中做attention。这下等于做了8份独立的self attention
+        # x: [1, 8, sl, 64]
+        # self.attn: [1, 8, sl, 10]
+        # 在最后两个dim (sl, 64) 中做attention。这下等于做了8份独立的self attention
         x, self.attn = attention(
             query, key, value, mask=mask, dropout=self.dropout
         )
 
         # 3) "Concat" using a view and apply a final linear.
-        # 把8个独立attention的结果，拼成一起，最终拼回到[1, 10, 512]，也就是和最早的输入大小完全一致
+        # 把8个独立attention的结果，拼成一起，最终拼回到[1, sl, 512]，也就是和最早的输入大小完全一致
         # transpose只是为了操作方便，并不影响model的学习能力
         # 我也承认这里的做法并不是唯一可行的做法
         x = (
-            x.transpose(1, 2)  # becomes [1, 10, 8, 64]
+            x.transpose(1, 2)  # becomes [1, sl, 8, 64]
             .contiguous()  # make a deep copy of Tensor
-            .view(nbatches, -1, self.h * self.d_k)  # reshape into [1, 10, 512]
+            .view(nbatches, -1, self.h * self.d_k)  # reshape into [1, sl, 512]
         )
         del query
         del key
         del value
-        # output: [1, 10, 512]
+        # output: [1, sl, 512]
         return self.linears[-1](x)
 
 
@@ -304,11 +318,15 @@ class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
         super(Embeddings, self).__init__()
         # 
-        # 11 -> 512
+        # src词汇表或者tgt词汇表的大小 -> 512
         self.lut = nn.Embedding(vocab, d_model)
+        # nn.Embedding进行forward的时候，
+        # 输入shape是[batch_size, 句子长度(固定，内容不够加mask)]，每个值都为单词的id num（也包括填充的dummy id）
+        # 输出shape是[batch_size, 句子长度(同上), embedding_dim size]，每个值都为embedding的float值
+        # 所以nn.Embedding自己内部其实做了one-hot encoding以及linear forward等操作
         self.d_model = d_model
 
-    # output: [1, 10, 512]
+    # output: [1, sl, 512]
     def forward(self, x):
         # 
         return self.lut(x) * math.sqrt(self.d_model)
@@ -338,7 +356,7 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe)
 
-    # output: [1, 10, 512]
+    # output: [1, sl, 512]
     def forward(self, x):
         # 
         x = x + self.pe[:, : x.size(1)].requires_grad_(False)
@@ -348,6 +366,9 @@ class PositionalEncoding(nn.Module):
 def make_model(
         src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1
 ):
+    # src_vocab = 8315
+    # tgt_vocab = 6384
+    pudb.set_trace()
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     # 
@@ -370,6 +391,7 @@ def make_model(
     for p in model.parameters():
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
+    # pudb.set_trace()
     return model
 
 
@@ -515,14 +537,28 @@ class SimpleLossCompute:
 
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
+    # src: [bs, 128(句长)]
+    # src_mask: [bs, 1, 128(句长)]
+    # pudb.set_trace()
+    # memory: [bs, 128(句长), 512(每个词的feature size)]
     memory = model.encode(src, src_mask)
+    print(model.encoder)
     # pudb.set_trace()
     # tb_writer.add_graph(model.encoder, [model.src_embed(src), src_mask])
+    # ys存的就是长度逐渐变长的prediction结果
+    # 最开始ys只有一个句首的start_symbol(数字0)，然后先predict一个词（无中生有），放到ys，然后ys里面有两个word了
+    # 然后ys
+    pudb.set_trace()
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
+        # out: [1, 1, 512]
+        mask = subsequent_mask(ys.size(1))
+        # mask是一个size递增的方阵，其左下角（包括对角线）都是true，其余都是false。这个就是作为attention mask用，
+        # 防止和还没有输出位置的词汇产生attention
         out = model.decode(
-            memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data)
+            memory, src_mask, ys, mask.type_as(src.data)
         )
+        # out: [1, 6384]
         prob = model.generator(out[:, -1])
         _, next_word = torch.max(prob, dim=1)
         next_word = next_word.data[0]
@@ -885,6 +921,7 @@ def check_outputs(
         pad_idx=2,
         eos_string="</s>",
 ):
+    pudb.set_trace()
     results = [()] * n_examples
     for idx in range(n_examples):
         print("\nExample %d ========\n" % idx)
@@ -948,7 +985,7 @@ def run_model_example(n_examples=5):
     return model, example_data
 
 
-model = load_trained_model()
+# load_trained_model()
 run_model_example(1)
 # pudb.set_trace()
 
