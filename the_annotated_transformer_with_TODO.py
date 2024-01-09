@@ -240,26 +240,22 @@ def subsequent_mask(size):
     return subsequent_mask == 0
 
 
-def attention(query, key, value, mask=None, dropout=None):
-    "Compute 'Scaled Dot Product Attention'"
-    # TODO(implement)
-
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
         "Take in model size and number of heads."
         super(MultiHeadedAttention, self).__init__()
         # 
         assert d_model % h == 0
-        # We assume d_v always equals d_k
-        # self.d_k: 64
-        self.d_k = d_model // h
+        # d_model: 512
+        self.d_model = d_model
         # self.h: 8
         self.h = h
-        # d_model: 512
+        self.d = self.d_model // self.h
         # Each linear layer: input 512, output 512
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        # 4个512 x 512的linear layer
+        self.linears = nn.ModuleList([nn.Linear(d_model, d_model)] * 4)
         self.attn = None
-        self.dropout = nn.Dropout(p=dropout)
+        # self.dropout = nn.Dropout(p=dropout)
 
     # query, key, value: [bs, sl, 512]
     # 但注意在做cross attention（decoding阶段）时，有可能query（从decoder出来，大小可能还很小因为才刚生成很少的word）
@@ -267,8 +263,57 @@ class MultiHeadedAttention(nn.Module):
     # query: [bs, 1, 512]
     # key: [bs, sl, 512]
     # value: [bs, sl, 512]
+    # 所以刚进来的时候是(x, x, x)或者是(x, m, m)的形式
     def forward(self, query, key, value, mask=None):
         # TODO(implement)
+        # [bs, ql, 512]
+        query = self.linears[0](query)
+        # [bs, sl, 512]
+        key = self.linears[1](key)
+        # [bs, sl, 512]
+        value = self.linears[2](value)
+
+        q_len = query.size(1)
+        # [bs, ql, 8, 64]
+        query = query.view(-1, q_len, self.h, self.d)
+        # [bs, 8, ql, 64]
+        query = query.transpose(1, 2)
+
+        k_len = key.size(1)
+        # [bs, sl, 8, 64]
+        key = key.view(-1, k_len, self.h, self.d)
+        # [bs, 8, sl, 64]
+        key= key.transpose(1, 2)
+
+        v_len = value.size(1)
+        assert k_len == v_len
+        # [bs, sl, 8, 64]
+        value = value.view(-1, v_len, self.h, self.d)
+        # [bs, 8, sl, 64]
+        value = value.transpose(1, 2)
+
+        # [bs, 8, ql, sl]
+        attention_matrix = torch.matmul(query, key.transpose(-2, -1))
+        attention_matrix /= math.sqrt(self.d)
+        if mask is not None:
+            # mask shape: [bs, 1, sl], unsqueeze to [bs, 1, 1, sl], so
+            # it's broadcastable to attention matrix
+            mask = mask.unsqueeze(1)
+            # print(f'attention_matrix shape: {attention_matrix.shape}, mask shape: {mask.shape}')
+            attention_matrix = attention_matrix.masked_fill(mask == 0, -1e9)
+
+        # [bs, 8, ql, sl], shape不变，在最后一维上做softmax
+        attention_matrix = attention_matrix.softmax(-1)
+
+        # [bs, 8, ql, 64]
+        attended_value = torch.matmul(attention_matrix, value)
+        # [bs, ql, 8, 64]
+        attended_value = attended_value.transpose(1, 2)
+        # [bs, ql, 512]
+        attended_value = attended_value.reshape(-1, q_len, self.d_model)
+
+        # [bs, ql, 512]
+        return self.linears[3](attended_value)
 
 
 class PositionwiseFeedForward(nn.Module):
@@ -519,7 +564,7 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
     # pudb.set_trace()
     # memory: [bs, sl, 512]
     memory = model.encode(src, src_mask)
-    print(model.encoder)
+    # print(model.encoder)
     # pudb.set_trace()
     # tb_writer.add_graph(model.encoder, [model.src_embed(src), src_mask])
     # ys存的就是长度逐渐变长的prediction结果
@@ -533,7 +578,7 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
         # TODO: out的shape好像有问题
         # ys_mask: [ys.size(1), ys.size(1)]，或者说是[ys的词数量,ys的词数量]
         ys_mask = subsequent_mask(ys.size(1))
-        pudb.set_trace()
+        # pudb.set_trace()
         # mask是一个size递增的方阵，其左下角（包括对角线）都是true，其余都是false。这个就是作为attention mask用，
         # 防止和还没有输出位置的词汇产生attention
         # src_mask: [bs, 1, sl]
@@ -832,7 +877,7 @@ def train_worker(
 
         model.train()
         print(f"[GPU{gpu}] Epoch {epoch} Training ====", flush=True)
-        pudb.set_trace()
+        # pudb.set_trace()
         _, train_state = run_epoch(
             (Batch(b[0], b[1], pad_idx) for b in train_dataloader),
             model,
@@ -930,7 +975,7 @@ def check_outputs(
         pad_idx=2,
         eos_string="</s>",
 ):
-    pudb.set_trace()
+    # pudb.set_trace()
     results = [()] * n_examples
     for idx in range(n_examples):
         print("\nExample %d ========\n" % idx)

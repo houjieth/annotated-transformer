@@ -247,6 +247,7 @@ def attention(query, key, value, mask=None, dropout=None):
     # [bs, 8, sl, sl]
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     if mask is not None:
+        print(f'scores shape: {scores.shape}, mask shape: {mask.shape}')
         scores = scores.masked_fill(mask == 0, -1e9)
     # [bs, 8, sl, sl]
     p_attn = scores.softmax(dim=-1)
@@ -1049,7 +1050,7 @@ def run_model_example(n_examples=5):
     return model, example_data
 
 
-# load_trained_model()
+load_trained_model()
 run_model_example(1)
 # pudb.set_trace()
 
